@@ -198,9 +198,6 @@ if __name__ == "__main__":
             default="\t",
             help="Output field separator. Default is TAB.",
         )
-        # arg_parser.add_argument(
-        #     "--no-csv", action="store_false", dest="csv", required=False, default=True, help="Do not convert to CSV."
-        # )
         arg_parser.add_argument(
             '-f-', '--format',
             action='store', choices=['csv', 'table', 'raw'], default='csv',
