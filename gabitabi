@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import os
+import re
 import requests
 import sys
 
@@ -84,10 +85,10 @@ def format_table(data):
     ]
 
     header_format = '|' + '|'.join(
-        " {:^" + f"{width}" + "} " for width in column_widths
+        f" {{:^{width}}} " for width in column_widths
     ) + '|'
     row_format = '|' + '|'.join(
-        " {:" + f"{width}" + "} " for width in column_widths
+        f" {{:{width}}} " for width in column_widths
     ) + '|'
     output = []
     output.append(header_format.format(*header))
@@ -98,8 +99,51 @@ def format_table(data):
     return output
 
 
+def table_from_query(query):
+    """
+    Find the first table mentioned in the query's FROM clause and assume
+    that's the primary table.
+    """
+    from_re = re.compile(r'FROM (\w+)', flags=re.I)
+    match = from_re.search(query)
+    if match:
+        return match.group(1)
+    else:
+        return None
 
-def process_results(out_file_name, data, fieldsep, out_format='csv'):
+
+def format_fixture(data, table=None):
+    """
+    Turn the table from a list of lists to a list of model entries
+    """
+    header = data[0]
+    id_field = 0
+    if 'id' in header:
+        id_field = header.index('id')
+    elif 'pk' in header:
+        id_field = header.index('pk')
+    if table:
+        model = table.replace('_', '.')
+    else:
+        # A dummy value for the user to fill in later.
+        model = 'app.model'
+    # Possible fixes:
+    # null fields to be replaced with 'null' instead of '""'
+    # '"false"' and '"true"' to be replaced with 'false' and 'true' bools
+    output = [
+        {
+            'model': model, 'pk': row[0], 'fields': {
+                header[fieldno]: data
+                for fieldno, data in enumerate(row)
+                if fieldno != id_field
+            }
+        }
+        for row in data[1:]
+    ]
+    return output
+
+
+def process_results(out_file_name, data, fieldsep, out_format='csv', query=None):
     """Process gabi json result into csv"""
     if data is not None and data["result"] is not None:
         out = sys.stdout if not out_file_name else open(out_file_name, "wt")
@@ -112,9 +156,17 @@ def process_results(out_file_name, data, fieldsep, out_format='csv'):
             elif out_format == 'table':
                 LOG.info(f"Writing {len(data['result'])} table rows to {out_target}")
                 out.write('\n'.join(format_table(data['result'])) + '\n')
+            elif out_format == 'fixture':
+                table = table_from_query(query)
+                LOG.info("Writing %d fixture rows to %s", len(data['result']), out_target)
+                out.write(json.dumps(format_fixture(data['result'], table), indent=2))
             else:
                 LOG.info(f"Writing JSON data to {out_target}")
-                out.write(json.dumps(data["result"]))
+                # out.write(json.dumps(data["result"]))
+                out.write("[\n")
+                for line in data["result"]:
+                    out.write(f"    {line},\n")
+                out.write("]\n")  # End with a new line so the prompt starts afresh
         finally:
             out.flush()
             out.close()
@@ -141,7 +193,7 @@ def process_query(out_file_name, url, token, query, fieldsep, out_format='csv', 
     if not validate_args(url, token, query):
         exit(1)
     result = submit_query_request(url, token, query, verify)
-    process_results(out_file_name, result, fieldsep, out_format=out_format)
+    process_results(out_file_name, result, fieldsep, out_format=out_format, query=query)
 
 
 if __name__ == "__main__":
@@ -200,7 +252,9 @@ if __name__ == "__main__":
         )
         arg_parser.add_argument(
             '-f-', '--format',
-            action='store', choices=['csv', 'table', 'raw'], default='csv',
+            action='store', choices=[
+                'csv', 'table', 'raw', 'fixture',
+            ], default='csv',
             help="The format of the output (CSV, table or raw JSON)"
         )
         arg_parser.add_argument(
