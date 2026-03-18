@@ -44,7 +44,9 @@ def healthcheck(url, token, verify=True):
     h_url = f"{url}/healthcheck"
     LOG.debug(GABI_REQUEST_DEBUG_TMPL.format(url=h_url, headers=headers, query_data={}))
     resp = requests.get(h_url, headers=headers, verify=verify)
-    if not resp.ok:
+    if resp.status_code == 403 and '<title>Log In</title>' in resp.text:
+        raise GabiError(f"GABI response 403: looks like you need to log in")
+    elif not resp.ok:
         raise GabiError(f"HTTP {resp.status_code} {resp.reason} : {resp.text}")
     data = resp.json()
     if data["status"] != "OK":
@@ -144,7 +146,7 @@ def format_fixture(data, table=None):
 
 
 def process_results(out_file_name, data, fieldsep, out_format='csv', query=None):
-    """Process gabi json result into csv"""
+    """Process gabi json result into chosen format"""
     if data is not None and data["result"] is not None:
         out = sys.stdout if not out_file_name else open(out_file_name, "wt")
         out_target = out_file_name or 'STDOUT'
