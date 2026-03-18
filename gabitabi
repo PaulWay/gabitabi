@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import os
+import re
 import requests
 import sys
 
@@ -37,13 +38,15 @@ class GabiTabiError(Exception):
     pass
 
 
-def healthcheck(url, token):
+def healthcheck(url, token, verify=True):
     """Verify that gabi is available."""
     headers = {"Authorization": f"Bearer {token}"}
     h_url = f"{url}/healthcheck"
     LOG.debug(GABI_REQUEST_DEBUG_TMPL.format(url=h_url, headers=headers, query_data={}))
-    resp = requests.get(h_url, headers=headers)
-    if not resp.ok:
+    resp = requests.get(h_url, headers=headers, verify=verify)
+    if resp.status_code == 403 and '<title>Log In</title>' in resp.text:
+        raise GabiError(f"GABI response 403: looks like you need to log in")
+    elif not resp.ok:
         raise GabiError(f"HTTP {resp.status_code} {resp.reason} : {resp.text}")
     data = resp.json()
     if data["status"] != "OK":
@@ -54,14 +57,14 @@ def healthcheck(url, token):
     return True
 
 
-def submit_query_request(url, token, query):
+def submit_query_request(url, token, query, verify=True):
     """Submit the query to gabi in the expected shape"""
     query_data = {"query": query}
     headers = {"Authorization": f"Bearer {token}"}
     q_url = f"{url}/query"
     LOG.info("Submitting query to gabi")
     LOG.debug(GABI_REQUEST_DEBUG_TMPL.format(url=q_url, headers=headers, query_data=json.dumps(query_data)))
-    resp = requests.post(q_url, headers=headers, json=query_data)
+    resp = requests.post(q_url, headers=headers, json=query_data, verify=verify)
     if not resp.ok:
         raise GabiError(f"HTTP {resp.status_code} {resp.reason} : {resp.text}")
 
@@ -72,18 +75,100 @@ def submit_query_request(url, token, query):
     return data
 
 
-def process_results(out_file_name, fieldsep, data, format_csv=True):
-    """Process gabi json result into csv"""
+def format_table(data):
+    """
+    Turn the table from a list of lists into a list of strings in table format.
+    """
+    header = data[0]
+    header_len = len(header)
+    column_widths = [
+        max(len(row[i]) for row in data)
+        for i in range(header_len)
+    ]
+
+    header_format = '|' + '|'.join(
+        f" {{:^{width}}} " for width in column_widths
+    ) + '|'
+    row_format = '|' + '|'.join(
+        f" {{:{width}}} " for width in column_widths
+    ) + '|'
+    output = []
+    output.append(header_format.format(*header))
+    output.append('+' + '+'.join('-' * (width+2) for width in column_widths) + '+')
+    for row in data[1:]:
+        output.append(row_format.format(*row))
+
+    return output
+
+
+def table_from_query(query):
+    """
+    Find the first table mentioned in the query's FROM clause and assume
+    that's the primary table.
+    """
+    from_re = re.compile(r'FROM (\w+)', flags=re.I)
+    match = from_re.search(query)
+    if match:
+        return match.group(1)
+    else:
+        return None
+
+
+def format_fixture(data, table=None):
+    """
+    Turn the table from a list of lists to a list of model entries
+    """
+    header = data[0]
+    id_field = 0
+    if 'id' in header:
+        id_field = header.index('id')
+    elif 'pk' in header:
+        id_field = header.index('pk')
+    if table:
+        model = table.replace('_', '.')
+    else:
+        # A dummy value for the user to fill in later.
+        model = 'app.model'
+    # Possible fixes:
+    # null fields to be replaced with 'null' instead of '""'
+    # '"false"' and '"true"' to be replaced with 'false' and 'true' bools
+    output = [
+        {
+            'model': model, 'pk': row[0], 'fields': {
+                header[fieldno]: data
+                for fieldno, data in enumerate(row)
+                if fieldno != id_field
+            }
+        }
+        for row in data[1:]
+    ]
+    return output
+
+
+def process_results(out_file_name, data, fieldsep, out_format='csv', query=None):
+    """Process gabi json result into chosen format"""
     if data is not None and data["result"] is not None:
         out = sys.stdout if not out_file_name else open(out_file_name, "wt")
+        out_target = out_file_name or 'STDOUT'
         try:
-            if format_csv:
-                LOG.info(f"Writing {len(data['result'])} CSV records to {out_file_name or 'STDOUT'}")
+            if out_format == 'csv':
+                LOG.info(f"Writing {len(data['result'])} CSV records to {out_target}")
                 writer = csv.writer(out, quoting=csv.QUOTE_ALL, delimiter=fieldsep)
                 writer.writerows(data["result"])
+            elif out_format == 'table':
+                LOG.info(f"Writing {len(data['result'])} table rows to {out_target}")
+                out.write('\n'.join(format_table(data['result'])) + '\n')
+            elif out_format == 'fixture':
+                table = table_from_query(query)
+                LOG.info("Writing %d fixture rows to %s", len(data['result']), out_target)
+                out.write(json.dumps(format_fixture(data['result'], table), indent=2))
             else:
-                LOG.info(f"Writing JSON data to {out_file_name or 'STDOUT'}")
-                out.write(json.dumps(data["result"]))
+                LOG.info(f"Writing JSON data to {out_target}")
+                # out.write(json.dumps(data["result"]))
+                out.write("[\n")
+                for line in data["result"]:
+                    out.write(f"    {line},\n")
+                out.write("]\n")  # End with a new line so the prompt starts afresh
         finally:
             out.flush()
             out.close()
@@ -105,11 +190,12 @@ def validate_args(url, token, query):
     return True
 
 
-def process_query(out_file_name, fieldsep, url, token, query, format_csv=True):
+def process_query(out_file_name, url, token, query, fieldsep, out_format='csv', verify=True):
     """Validate gabi parameters, submit the query, format the result for csv."""
-    if validate_args(url, token, query):
-        result = submit_query_request(url, token, query)
-        process_results(out_file_name, fieldsep, result, format_csv=format_csv)
+    if not validate_args(url, token, query):
+        exit(1)
+    result = submit_query_request(url, token, query, verify)
+    process_results(out_file_name, result, fieldsep, out_format=out_format, query=query)
 
 
 if __name__ == "__main__":
@@ -167,7 +253,11 @@ if __name__ == "__main__":
             help="Output field separator. Default is TAB.",
         )
         arg_parser.add_argument(
-            "--no-csv", action="store_false", dest="csv", required=False, default=True, help="Do not convert to CSV."
+            '-f-', '--format',
+            action='store', choices=[
+                'csv', 'table', 'raw', 'fixture',
+            ], default='csv',
+            help="The format of the output (CSV, table or raw JSON)"
         )
         arg_parser.add_argument(
             "--ping",
@@ -184,6 +274,14 @@ if __name__ == "__main__":
             default=False,
             required=False,
             help="Set logging level to DEBUG.",
+        )
+        arg_parser.add_argument(
+            '--noverify',
+            dest='verify',
+            action='store_false',
+            default=True,
+            required=False,
+            help='Do not verify the SSL certificate',
         )
 
         return arg_parser
@@ -220,9 +318,12 @@ if __name__ == "__main__":
     args = process_args(gabitabi_argparser())
 
     # Verify that gabi is available
-    healthcheck(args.url, args.token)
+    healthcheck(args.url, args.token, args.verify)
     if args.only_ping:
         sys.exit(0)
 
     # Call the main processing entrypoint
-    process_query(args.out_file_name, args.separator, args.url, args.token, args.query, format_csv=args.csv)
+    process_query(
+        args.out_file_name, args.url, args.token, args.query,
+        args.separator, out_format=args.format, verify=args.verify
+    )
